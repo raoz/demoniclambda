@@ -185,13 +185,13 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
                                 reduced = Times (eval c a) (eval c b)
                 eval' c (Minus (Number a) (Number b)) = Number (a - b)
                 eval' c (Minus a b)
-                        | (Minus a b) == reduced = Times a b
+                        | (Minus a b) == reduced = Minus a b
                         | otherwise = eval c reduced
                         where 
                                 reduced = Minus (eval c a) (eval c b)
                 eval' c (Divide (Number a) (Number b)) = Number (a `div` b)
                 eval' c (Divide a b)
-                        | (Divide a b) == reduced = Times a b
+                        | (Divide a b) == reduced = Divide a b
                         | otherwise = eval c reduced
                         where 
                                 reduced = Divide (eval c a) (eval c b)
