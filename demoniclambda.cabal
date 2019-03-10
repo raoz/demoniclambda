@@ -20,5 +20,7 @@ executable demoniclambda
   build-depends:       base >= 4.7 && < 5,
                        parsec >= 3.1.13 && < 4,
                        containers >= 0.6 && < 1,
-                       haskeline >= 0.7.5.0 && < 1
-  extensions:          OverloadedStrings
+                       haskeline >= 0.7.5.0 && < 1,
+		       llvm-hs-pure >= 7.0 && < 8,
+		       llvm-hs >= 7.0 && < 8
+  extensions:          OverloadedStrings, GeneralizedNewtypeDeriving

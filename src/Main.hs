@@ -16,6 +16,18 @@ import System.IO
 import System.Console.Haskeline
 
 
+--CODEGEN
+import LLVM.AST
+import LLVM.AST.Global
+import qualified LLVM.AST as AST
+
+import qualified LLVM.AST.Linkage as L
+import qualified LLVM.AST.Constant as C
+import qualified LLVM.AST.Attribute as A
+import qualified LLVM.AST.CallingConvention as CC
+import qualified LLVM.AST.FloatingPointPredicate as FP
+
+
 data Term = Variable String 
           | Abstraction String Term 
           | Application Term Term 
@@ -196,6 +208,12 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
                         where 
                                 reduced = Divide (eval c a) (eval c b)
                 eval' c x = x
+
+-- LLVM
+
+--num :: Type
+--num = IntegerType 64
+
 
 
 main :: IO ()
