@@ -1,6 +1,10 @@
 module Main where
 import Debug.Trace
 
+import Syntax
+import CPS
+import Codegen
+
 import qualified Data.Map as M
 
 import Text.Parsec
@@ -14,45 +18,12 @@ import Text.Parsec.Language (emptyDef)
 import System.IO
 
 import System.Console.Haskeline
+import Control.Monad.IO.Class
 
 
---CODEGEN
-import LLVM.AST
-import LLVM.AST.Global
-import qualified LLVM.AST as AST
-
-import qualified LLVM.AST.Linkage as L
-import qualified LLVM.AST.Constant as C
-import qualified LLVM.AST.Attribute as A
-import qualified LLVM.AST.CallingConvention as CC
-import qualified LLVM.AST.FloatingPointPredicate as FP
 
 
-data Term = Variable String 
-          | Abstraction String Term 
-          | Application Term Term 
-          | Number Integer
-          | Plus Term Term
-          | Times Term Term
-          | Minus Term Term
-          | Divide Term Term
-          | Boolean Bool deriving (Eq)
 
-instance Show Term
-        where
-                show (Variable v) = v
-                show (Abstraction v t) = lambda <> v <> "." <> show t
-                show (Application t1 t2) = "(" <> show t1 <> ") (" <> show t2 <> ")"
-                show (Number n) = show n
-                show (Boolean True) = "⊤"
-                show (Boolean False) = "⊥"
-                show (Plus t1 t2) = "(" <> show t1 <> " + " <> show t2 <> ")"
-                show (Minus t1 t2) = "(" <> show t1 <> " - " <> show t2 <> ")"
-                show (Times t1 t2) = "(" <> show t1 <> " · " <> show t2 <> ")"
-                show (Divide t1 t2) = "(" <> show t1 <> " / " <> show t2 <> ")"
-
-lambda = "λ"
-comment = "―"
 
 
 lexer :: Tok.TokenParser ()
@@ -209,10 +180,20 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
                                 reduced = Divide (eval c a) (eval c b)
                 eval' c x = x
 
--- LLVM
+-- CPS
 
---num :: Type
---num = IntegerType 64
+
+
+
+
+
+-- ANF
+
+-- data Aexp = Number Integer | Boolean Bool | Variable Int
+--             | Abstraction Int Exp
+-- data Cexp = Application Aexp Aexp | If Aexp Exp Exp
+-- data Exp  = Let Int Cexp Exp | Cexp | Aexp
+
 
 
 
@@ -227,6 +208,10 @@ main = runInputT defaultSettings loop
                                         let p = parseTerm s
                                         case p of
                                                 Left err -> outputStrLn . show $ err
-                                                Right ast -> outputStrLn . show $ eval M.empty ast
+                                                --Right ast -> outputStrLn . show $ eval M.empty ast
+                                                Right ast -> do
+                                                        outputStrLn . show $ transformCPS ast
+                                                        liftIO $ codegen  (emptyModule "test") $ transformCPS ast
+                                                        return ()
                                         loop
 
