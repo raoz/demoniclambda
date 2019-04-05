@@ -21,7 +21,10 @@ import System.Console.Haskeline
 import Control.Monad.IO.Class
 
 
+import Text.Pretty.Simple (pShow)
 
+
+import qualified Data.Text.Lazy as LT
 
 
 
@@ -30,7 +33,7 @@ lexer :: Tok.TokenParser ()
 lexer = Tok.makeTokenParser style
         where
                 style = emptyDef {
-                        Tok.reservedOpNames = ["+"],
+                        Tok.reservedOpNames = [],
                         Tok.commentLine = comment,
                         Tok.reservedNames = [lambda],
                         Tok.identStart   = letter <|> char '_',
@@ -100,10 +103,12 @@ number = do
 
 binary s f assoc = Ex.Infix (reservedOp s >> return f) assoc
 
-table = [[binary "·" Times Ex.AssocLeft,
-          binary "/" Divide Ex.AssocLeft]
-        ,[binary "+" Plus Ex.AssocLeft,
-          binary "-" Minus Ex.AssocLeft]]
+table = [[binary "·" (BinOp "·") Ex.AssocLeft,
+          binary "/" (BinOp "/") Ex.AssocLeft]
+        ,[binary "+" (BinOp "+") Ex.AssocLeft,
+          binary "-" (BinOp "-") Ex.AssocLeft]
+        ,[binary "∧" (BinOp "∧") Ex.AssocRight]
+        ,[binary "∨" (BinOp "∨") Ex.AssocRight]]
 
 expr :: Parser Term
 expr = Ex.buildExpressionParser table term
@@ -154,45 +159,21 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
                         where
                                 reducedAbs = eval c t
 
-                eval' c (Plus (Number a) (Number b)) = Number (a + b)
-                eval' c (Plus a b)
-                        | (Plus a b) == reduced = Plus a b
+                eval' c (BinOp op (Number a) (Number b)) = case op of
+                        "+" -> Number (a + b)
+                        "-" -> Number (a - b)
+                        "/" -> Number (a `div` b)
+                        "·" -> Number (a * b)
+                eval' c (BinOp op (Boolean a) (Boolean b)) = case op of
+                        "∧" -> Boolean (a && b)
+                        "∨" -> Boolean (a || b)
+                eval' c (BinOp op a b)
+                        | (BinOp op a b) == reduced = BinOp op a b
                         | otherwise = eval c reduced
                         where 
-                                reduced = Plus (eval c a) (eval c b)
-                eval' c (Times (Number a) (Number b)) = Number (a * b)
-                eval' c (Times a b)
-                        | (Times a b) == reduced = Times a b
-                        | otherwise = eval c reduced
-                        where 
-                                reduced = Times (eval c a) (eval c b)
-                eval' c (Minus (Number a) (Number b)) = Number (a - b)
-                eval' c (Minus a b)
-                        | (Minus a b) == reduced = Minus a b
-                        | otherwise = eval c reduced
-                        where 
-                                reduced = Minus (eval c a) (eval c b)
-                eval' c (Divide (Number a) (Number b)) = Number (a `div` b)
-                eval' c (Divide a b)
-                        | (Divide a b) == reduced = Divide a b
-                        | otherwise = eval c reduced
-                        where 
-                                reduced = Divide (eval c a) (eval c b)
+                                reduced = BinOp op (eval c a) (eval c b)
+
                 eval' c x = x
-
--- CPS
-
-
-
-
-
-
--- ANF
-
--- data Aexp = Number Integer | Boolean Bool | Variable Int
---             | Abstraction Int Exp
--- data Cexp = Application Aexp Aexp | If Aexp Exp Exp
--- data Exp  = Let Int Cexp Exp | Cexp | Aexp
 
 
 
@@ -210,8 +191,8 @@ main = runInputT defaultSettings loop
                                                 Left err -> outputStrLn . show $ err
                                                 --Right ast -> outputStrLn . show $ eval M.empty ast
                                                 Right ast -> do
-                                                        outputStrLn . show $ transformCPS ast
-                                                        liftIO $ codegen  (emptyModule "test") $ transformCPS ast
+                                                        outputStrLn . LT.unpack . pShow $ transformCPS ast
+                                                        liftIO . codegen $ transformCPS ast
                                                         return ()
                                         loop
 

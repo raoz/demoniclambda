@@ -1,10 +1,10 @@
+{-# LANGUAGE ViewPatterns #-}
 module Codegen where
 
 import CPS
 import Control.Monad.State
 
-import LLVM.Module
-import LLVM.Context
+import Debug.Trace
 
 import Control.Monad.Except
 
@@ -16,332 +16,274 @@ import Data.Word
 import Data.String
 import Data.List
 import Data.Function
+import Data.Char (isAscii)
 
 import qualified Data.Map as M
+import Text.Pretty.Simple (pShow)
 
 
-import LLVM.AST
-import LLVM.AST.Global
-import qualified LLVM.AST as AST
-
-import qualified LLVM.AST.Linkage as L
-import qualified LLVM.AST.Constant as C
-import qualified LLVM.AST.Attribute as A
-import qualified LLVM.AST.CallingConvention as CC
-import qualified LLVM.AST.FloatingPointPredicate as FP
 
 import qualified Data.Text as T
+import qualified Data.Text.Lazy as LT
 import Data.Text.Encoding (encodeUtf8)
 
-packStr :: String -> ShortByteString
-packStr = toShort . encodeUtf8 . T.pack
+-- Pure
+import LLVM.AST hiding (function)
+import LLVM.AST.Typed
+import LLVM.AST.Type as AST
+import qualified LLVM.AST.Float as F
+import qualified LLVM.AST.Constant as C
+import qualified LLVM.AST.IntegerPredicate as P
 
--------------------------------------------------------------------------------
--- Module Level
--------------------------------------------------------------------------------
+import LLVM.IRBuilder.Module
+import LLVM.IRBuilder.Monad
+import LLVM.IRBuilder.Instruction as I
+import LLVM.IRBuilder.Constant
 
-newtype LLVM a = LLVM (State AST.Module a)
-  deriving (Functor, Applicative, Monad, MonadState AST.Module )
+--Nonpure
+import LLVM.Analysis
+import LLVM.Context
+import qualified LLVM.Module as LVM
 
-runLLVM :: AST.Module -> LLVM a -> AST.Module
-runLLVM mod (LLVM m) = execState m mod
+import qualified Data.Text.Punycode as Punycode
 
-emptyModule :: ShortByteString -> AST.Module
-emptyModule label = defaultModule { moduleName = label }
 
-addDefn :: Definition -> LLVM ()
-addDefn d = do
-  defs <- gets moduleDefinitions
-  modify $ \s -> s { moduleDefinitions = defs <> [d] }
+encodename :: String -> ShortByteString
+encodename str 
+        | all isAscii str =  fromString str
+        | otherwise = toShort . Punycode.encode . T.pack $ str
 
-define ::  Type -> ShortByteString -> [(Type, Name)] -> [BasicBlock] -> LLVM ()
-define retty label argtys body = addDefn $
-  GlobalDefinition $ functionDefaults {
-    name        = Name label
-  , parameters  = ([Parameter ty nm [] | (ty, nm) <- argtys], False)
-  , returnType  = retty
-  , basicBlocks = body
-  }
+codename :: String -> Name
+codename = Name . encodename
 
-external ::  Type -> ShortByteString -> [(Type, Name)] -> LLVM ()
-external retty label argtys = addDefn $
-  GlobalDefinition $ functionDefaults {
-    name        = Name label
-  , linkage     = L.External
-  , parameters  = ([Parameter ty nm [] | (ty, nm) <- argtys], False)
-  , returnType  = retty
-  , basicBlocks = []
-  }
 
----------------------------------------------------------------------------------
--- Types
--------------------------------------------------------------------------------
+-----------
+-- TYPES --
+-----------
+voidptr :: AST.Type
+voidptr = AST.ptr AST.i8
 
-num :: Type
-num = IntegerType 64
+num :: AST.Type
+num = AST.i32
 
-closure :: Aexp -> Type
-closure = undefined
+consti32 :: Integer -> Operand
+consti32 n = ConstantOperand $ C.Int 32 n
+
+nullptr ::Operand
+nullptr = ConstantOperand $ C.IntToPtr (C.Int 64 0) voidptr
+
+demonicfun = AST.FunctionType voidptr [voidptr, voidptr, voidptr] False
+
+closure :: AST.Type
+closure = AST.StructureType False [
+        ptr demonicfun,
+        voidptr ]
 
 context :: [String] -> Type
-context frees = ArrayType (fromIntegral $ Data.List.length frees) num
+context frees = AST.ArrayType (fromIntegral $ Data.List.length frees) voidptr
 
 
+toSig :: [String] -> [(Type, ParameterName)]
+toSig = zip (repeat voidptr) . map (ParameterName . encodename)
 
--------------------------------------------------------------------------------
--- Names
--------------------------------------------------------------------------------
 
-type Names = M.Map ShortByteString Int
+demonicfunref :: MonadModuleBuilder m => Name -> m Operand
+demonicfunref name = pure $ ConstantOperand $ C.GlobalReference (ptr demonicfun) name
 
-uniqueName :: ShortByteString -> Names -> (ShortByteString, Names)
-uniqueName nm ns =
-  case M.lookup nm ns of
-    Nothing -> (nm,  M.insert nm 1 ns)
-    Just ix -> (nm <> (packStr $ show ix), M.insert nm (ix+1) ns)
-
--------------------------------------------------------------------------------
--- Codegen State
--------------------------------------------------------------------------------
-
-
-
-type SymbolTable = [(ShortByteString, Operand)]
-
-data CodegenState
-  = CodegenState {
-    currentBlock :: Name                     -- Name of the active block to append to
-  , blocks       :: M.Map Name BlockState  -- Blocks for function
-  , symtab       :: SymbolTable              -- Function scope symbol table
-  , blockCount   :: Int                      -- Count of basic blocks
-  , count        :: Word                     -- Count of unnamed instructions
-  , names        :: Names                    -- Name Supply
-  } deriving Show
-
-data BlockState
-  = BlockState {
-    idx   :: Int                            -- Block index
-  , stack :: [Named Instruction]            -- Stack of instructions
-  , termi  :: Maybe (Named Terminator)       -- Block terminator
-  } deriving Show
-
--------------------------------------------------------------------------------
--- Codegen Operations
--------------------------------------------------------------------------------
-
-newtype Codegen a = Codegen { runCodegen :: State CodegenState a }
-  deriving (Functor, Applicative, Monad, MonadState CodegenState )
-
-sortBlocks :: [(Name, BlockState)] -> [(Name, BlockState)]
-sortBlocks = sortBy (compare `on` (idx . snd))
-
-createBlocks :: CodegenState -> [BasicBlock]
-createBlocks m = map makeBlock $ sortBlocks $ M.toList (blocks m)
-
-makeBlock :: (Name, BlockState) -> BasicBlock
-makeBlock (l, (BlockState _ s t)) = BasicBlock l (reverse s) (maketerm t)
-  where
-    maketerm (Just x) = x
-    maketerm Nothing = error $ "Block has no terminator: " <> (show l)
-
-entryBlockName :: ShortByteString
-entryBlockName = "entry"
-
-emptyBlock :: Int -> BlockState
-emptyBlock i = BlockState i [] Nothing
-
-emptyCodegen :: CodegenState
-emptyCodegen = CodegenState (Name entryBlockName) M.empty [] 1 0 M.empty
-
-execCodegen :: Codegen a -> CodegenState
-execCodegen m = execState (runCodegen m) emptyCodegen
-
-freshW :: Codegen Word
-freshW = do
-  i <- gets count
-  modify $ \s -> s { count = 1 + i }
-  return $ i + 1
-
-instr :: Instruction -> Codegen (Operand)
-instr ins = do
-  n <- freshW
-  let ref = (UnName n)
-  blk <- current
-  let i = stack blk
-  modifyBlock (blk { stack = (ref := ins) : i } )
-  return $ local ref
-
-terminator :: Named Terminator -> Codegen (Named Terminator)
-terminator trm = do
-  blk <- current
-  modifyBlock (blk { termi = Just trm })
-  return trm
-
--------------------------------------------------------------------------------
--- Block Stack
--------------------------------------------------------------------------------
-
-entry :: Codegen Name
-entry = gets currentBlock
-
-addBlock :: ShortByteString -> Codegen Name
-addBlock bname = do
-  bls <- gets blocks
-  ix  <- gets blockCount
-  nms <- gets names
-
-  let new = emptyBlock ix
-      (qname, supply) = uniqueName bname nms
-
-  modify $ \s -> s { blocks = M.insert (Name qname) new bls
-                   , blockCount = ix + 1
-                   , names = supply
-                   }
-  return (Name qname)
-
-setBlock :: Name -> Codegen Name
-setBlock bname = do
-  modify $ \s -> s { currentBlock = bname }
-  return bname
-
-getBlock :: Codegen Name
-getBlock = gets currentBlock
-
-modifyBlock :: BlockState -> Codegen ()
-modifyBlock new = do
-  active <- gets currentBlock
-  modify $ \s -> s { blocks = M.insert active new (blocks s) }
-
-current :: Codegen BlockState
-current = do
-  c <- gets currentBlock
-  blks <- gets blocks
-  case M.lookup c blks of
-    Just x -> return x
-    Nothing -> error $ "No such block: " <> show c
-
--------------------------------------------------------------------------------
--- Symbol Table
--------------------------------------------------------------------------------
-
-assign :: ShortByteString -> Operand -> Codegen ()
-assign var x = do
-  lcls <- gets symtab
-  modify $ \s -> s { symtab = [(var, x)] <> lcls }
-
-getvar :: ShortByteString -> Codegen Operand
-getvar var = do
-  syms <- gets symtab
-  case lookup var syms of
-    Just x  -> return x
-    Nothing -> error $ "Local variable not in scope: " <> show var
-
--------------------------------------------------------------------------------
-
--- References
-local ::  Name -> Operand
-local = LocalReference num
-
-global ::  Name -> C.Constant
-global = C.GlobalReference num
-
-externf :: Name -> Operand
-externf = ConstantOperand . C.GlobalReference num
-
--- Arithmetic and Constants
---fadd :: Operand -> Operand -> Codegen Operand
---fadd a b = instr $ FAdd NoFastMathFlags a b []
---
---fsub :: Operand -> Operand -> Codegen Operand
---fsub a b = instr $ FSub NoFastMathFlags a b []
---
---fmul :: Operand -> Operand -> Codegen Operand
---fmul a b = instr $ FMul NoFastMathFlags a b []
---
---fdiv :: Operand -> Operand -> Codegen Operand
---fdiv a b = instr $ FDiv NoFastMathFlags a b []
---
---fcmp :: FP.FloatingPointPredicate -> Operand -> Operand -> Codegen Operand
---fcmp cond a b = instr $ FCmp cond a b []
-
-cons :: C.Constant -> Operand
-cons = ConstantOperand
-
-uitofp :: Type -> Operand -> Codegen Operand
-uitofp ty a = instr $ UIToFP a ty []
-
-toArgs :: [Operand] -> [(Operand, [A.ParameterAttribute])]
-toArgs = map (\x -> (x, []))
-
--- Effects
-call :: Operand -> [Operand] -> Codegen Operand
-call fn args = instr $ Call Nothing CC.C [] (Right fn) (toArgs args) [] []
-
-alloca :: Type -> Codegen Operand
-alloca ty = instr $ Alloca ty Nothing 0 []
-
-store :: Operand -> Operand -> Codegen Operand
-store ptr val = instr $ Store False ptr val Nothing 0 []
-
-load :: Operand -> Codegen Operand
-load ptr = instr $ Load False ptr Nothing 0 []
-
--- Control Flow
-br :: Name -> Codegen (Named Terminator)
-br val = terminator $ Do $ Br val []
-
-cbr :: Operand -> Name -> Name -> Codegen (Named Terminator)
-cbr cond tr fl = terminator $ Do $ CondBr cond tr fl []
-
-ret :: Operand -> Codegen (Named Terminator)
-ret val = terminator $ Do $ Ret (Just val) []
-
-
-
-
-
-
-
-
-
-
-
-
-cgena :: Aexp -> Codegen AST.Operand
-cgena (CNumber n) = return . cons $ C.Int 64 n
-
-toSig :: [String] -> [(AST.Type, AST.Name)]
-toSig = map (\x -> (num, AST.Name $ packStr x))
-
-
-codegenTop :: Cexp -> LLVM ()
-codegenTop (CApplication f ts) = do
-        define num "main" [] blks
+primref :: MonadModuleBuilder m => String -> m Operand
+primref name = pure . ConstantOperand $ C.GlobalReference (ptr . maybe (error $ "Undefined primop " <> name) id . lookup trueName $ primExternalType) trueName
         where
-                blks = createBlocks $ execCodegen $ do
-                        entry <- addBlock entryBlockName
-                        setBlock entry
-                        cgena (CNumber 42) >>= ret
-codegenAbs :: Aexp -> LLVM ()
-codegenAbs (CAbstraction name frees args ts) = do
-        define num (packStr name) ([(context frees, "ctx")] <> toSig args) blks
+                trueName = codename name
+
+
+
+cgenc :: (MonadIRBuilder m, MonadModuleBuilder m) => (String -> Operand) -> [String] -> Cexp -> m Operand
+cgenc localArgs frees (CApplication f args) = do
+        --traceM ("application " <> show f <> " " <> show args )
+        left <- cgena localArgs frees f
+        leftCast <- bitcast left $ ptr closure
+        --traceM ("left " <> show left <> " leftCast " <> (show $ typeOf left))
+        --traceShowM $ typeOf left
+        --traceM "\n"
+        --traceM "*leftCast"
+        --traceShowM $ getElementType (typeOf leftCast)
+        --traceM "\n"
+        funpPos <- gep leftCast [consti32 0, consti32 0]
+        ctxPos  <- gep leftCast [consti32 0, consti32 1]
+        funp <- load funpPos 0
+        ctx  <- load ctxPos 0
+        argOps <- mapM (cgena localArgs frees) args
+        argVOps <- mapM (\arg -> bitcast arg voidptr) argOps
+        let right = take 2 (argVOps ++ repeat nullptr)
+        call funp . zip (ctx:right) $ repeat []
+        --cgena [] (CNumber 42)
+
+
+
+createClosure :: (MonadIRBuilder m, MonadModuleBuilder m) => (String -> Operand) -> [String] -> [String] -> m Operand
+createClosure localArgs frees contextFrees = do
+        ctx <- alloca (voidptr) (Just . consti32 . fromIntegral $ Data.List.length frees) 0
+--        ctx <- alloca (context frees) Nothing 0
+        forM (zip [0..] frees) $ \(i, free) -> do
+                var <- cgena localArgs contextFrees (CVariable free)
+                ctxPos <- gep ctx [consti32 i]
+                store ctxPos 0 var
+        bitcast ctx voidptr
+
+
+cgena :: (MonadIRBuilder m, MonadModuleBuilder m) => (String -> Operand) -> [String] -> Aexp -> m Operand
+cgena localArgs _ (CNumber n) = do
+        var <- alloca num Nothing 0
+        int32 n >>= store var 0
+        bitcast var voidptr
+
+--
+--
+cgena localArgs frees (CAbstraction fname innerFrees _ _) = do
+        -- traceM ("cgena " <> fname)
+        fptr <- demonicfunref $ codename fname
+        ctx <- createClosure localArgs innerFrees frees
+        cl <- alloca closure Nothing 0
+        fpos <- gep cl [consti32 0, consti32 0]
+        cpos <- gep cl [consti32 0, consti32 1]
+        store fpos 0 fptr
+        store cpos 0 ctx
+        voidcl <- bitcast cl voidptr 
+        --traceM ("cgena " <> fname <> " -> " <> show cl <> " -> " <> show voidcl)
+        return voidcl
+
+cgena localArgs frees (CVariable x) = case elemIndex x frees of
+        Just n -> do
+                traceM $ x <> " is free"
+                let ctx = localArgs "ctx"
+                typedCtx <- bitcast ctx $ ptr (context frees)
+                ctxPos <- gep typedCtx [consti32 0, consti32 $ fromIntegral n]
+                load ctxPos 0
+        Nothing -> trace (x <> " is bound") . return $ localArgs x
+cgena localArgs frees Top = cgena localArgs frees (CAbstraction "ctop" [] ["retval"] (CApplication (CNumber 0) []))
+
+
+
+codegenTop :: Cexp -> ModuleBuilder ()
+codegenTop cexp = do
+        function 
+                (codename "main")
+                []
+                num
+                $ \[] -> mdo
+                        _entry <- block `named` "entry"
+                        resvoidptr <- cgenc (\x -> error $ "Variable " <> x <> " cannot be defined because it occurs at the top level") [] cexp
+                        resnumptr  <- bitcast resvoidptr (ptr num)
+                        res <- load resnumptr 0
+                        ret res
+        return ()
+
+
+        
+codegenAbs :: Aexp -> ModuleBuilder ()
+codegenAbs (CAbstraction (stripPrefix "operator" -> Just f) frees args Bottom) = do
+        function 
+                (codename ("operator" <> f))
+                sig
+                voidptr
+                $ \[ctxv, b, cont] -> mdo
+                        let largs = zip (map snd sig) [ctxv, b, cont]
+                        let largLookup = \x -> maybe (error (x <> " is not defined")) id $ lookup (ParameterName $ encodename x) largs
+                        _entry <- block `named` "entry"
+                        aptr <- cgena largLookup frees (CVariable "a")
+                        bptr <- cgena largLookup frees (CVariable "b")
+
+                        aa <- bitcast aptr (ptr num) >>= \p -> load p 0
+                        bb <- bitcast bptr (ptr num) >>= \p -> load p 0
+
+                        res <- primBinOp f aa bb 
+                        var <- alloca num Nothing 0
+                        store var 0 res
+                        resptr <- bitcast var voidptr
+
+                        leftCast <- bitcast cont $ ptr closure
+                        funpPos <- gep leftCast [consti32 0, consti32 0]
+                        ctxPos  <- gep leftCast [consti32 0, consti32 1]
+
+                        funp <- load funpPos 0
+                        innerctx  <- load ctxPos 0
+                        call funp [(innerctx, []), (resptr, []), (nullptr, [])] >>= ret
+        return ()
         where
-                blks = createBlocks $ execCodegen $ do
-                        entry <- addBlock entryBlockName
-                        setBlock entry
-                        cgena (CNumber 42) >>= ret
+                sig = take 3 $ [(voidptr, ParameterName $ encodename "ctx")] <> toSig args <> repeat (voidptr, "unused")
+        
+
+codegenAbs (CAbstraction _ frees args Bottom) = error "Unknown bottom function"
+
+codegenAbs (CAbstraction name frees args cexp) = do
+        function 
+                (codename name)
+                sig
+                voidptr
+                $ \args -> mdo
+                        let largs = zip (map snd sig) args
+                        let largLookup = \x -> maybe (error (x <> " is not defined")) id $ lookup (ParameterName $ encodename x) largs
+                        _entry <- block `named` "entry"
+                        cgenc largLookup frees cexp >>= ret 
+        return ()
+        where
+                sig = take 3 $ [(voidptr, ParameterName $ encodename "ctx")] <> toSig args <> repeat (voidptr, "unused")
+
+codegenCTop :: ModuleBuilder ()
+codegenCTop = do
+        function 
+                (codename "ctop") 
+                [(voidptr, "unused"), (voidptr, "res"), (voidptr, "unused")]
+                voidptr
+                $ \[_, res, _] -> mdo
+                        _entry <- block `named` "entry"
+                        resCast <- bitcast res $ ptr num
+                        answer <- load resCast 0 
+                        exit <- primref "exit"
+                        call exit [(answer,[])] >> ret nullptr
+        return ()
+
+
+declareFun :: Aexp -> ModuleBuilder ()
+declareFun (CAbstraction name _ args _) = extern (codename name) [voidptr, voidptr, voidptr] voidptr  >> return ()
+
+declareExterns :: ModuleBuilder ()
+declareExterns = do
+        forM primExternal $ \(name, retty, args, vararg) -> extern name args retty  
+        return ()
+
+primExternal :: [(Name, Type, [Type], Bool)]
+primExternal = [(codename "exit", voidptr, [AST.i32], False)]
+
+primExternalType :: [(Name, Type)]
+primExternalType = map (\(name, retty, argty, vararg) -> (codename "exit", AST.FunctionType retty argty vararg)) primExternal 
+
+
+primBinOp :: MonadIRBuilder m => String -> (Operand -> Operand -> m Operand)
+primBinOp "+"   = add
+primBinOp "-"   = sub
+primBinOp "·" = mul
+primBinOp "/"   = sdiv
+primBinOp "∧" = I.and
+primBinOp "∨"  = I.or
 
 
 
-
-
-codegen :: AST.Module -> Cexp -> IO AST.Module
-codegen mod topExp = withContext $ \context ->
-  withModuleFromAST context newast $ \m -> do
-    llstr <- moduleLLVMAssembly m
-    BS.putStrLn llstr
-    return newast
-  where
-    modn = codegenTop topExp >> mapM codegenAbs fns
-    fns = getCAbstractions topExp
-    newast = runLLVM mod modn
+codegen :: Cexp -> IO Module
+codegen topExp = withContext $ \ctx -> do
+        --putStrLn . show $ ppllvm newast
+        LVM.withModuleFromAST ctx newast $ \m -> do --(trace (LT.unpack $ pShow newast) newast) $ \m -> do
+                traceM "lowered"
+                verify m
+                traceM "verif"
+                llstr <- LVM.moduleLLVMAssembly m
+                BS.putStrLn llstr
+                LVM.writeLLVMAssemblyToFile (LVM.File "a.ll") m
+                --    withHostTargetMachine $ \hostMachine -> do
+                --        writeObjectToFile hostMachine (File "a.out") m
+                return newast
+        where
+                modn = declareExterns >> codegenCTop >> mapM declareFun fns >> mapM codegenAbs fns >> codegenTop topExp
+                --modn = codegenCTop >> mapM declareFun fns >> codegenTop topExp
+                fns = getCAbstractions topExp
+                newast = buildModule "test" modn

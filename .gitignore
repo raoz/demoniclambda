@@ -1,5 +1,9 @@
 .stack-work
+.gdb_history
 
+*.ll
+*.o
+*.out
 
 
 # Created by https://www.gitignore.io/api/vim,linux,haskell,windows
