@@ -1,4 +1,7 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 module Main where
+
 import Debug.Trace
 
 import Syntax
@@ -20,123 +23,104 @@ import System.IO
 import System.Console.Haskeline
 import Control.Monad.IO.Class
 
+import           TreeSitter.Parser
+import           TreeSitter.Tree
+import           TreeSitter.Language
+import           TreeSitter.DemonicLambda
+import           TreeSitter.Node
+import           Foreign.C.String
+import           Foreign.C.Types
+import           Foreign.Ptr                    ( Ptr(..)
+                                                , nullPtr
+                                                , plusPtr
+                                                )
+import           Foreign.Marshal.Alloc          ( malloc
+                                                , mallocBytes
+                                                )
+import           Foreign.Marshal.Array          ( mallocArray
+                                                , advancePtr)
+import           Foreign.Storable               ( peek
+                                                , peekElemOff
+                                                , poke
+                                                )
+import           Foreign.Marshal.Utils          ( new )
+import           Control.Monad
+
+import Foreign
+import Foreign.C
+import GHC.Generics
+import Text.Parsec.Error
+import Text.Parsec.Pos
+import Control.Monad.Except
 
 import Text.Pretty.Simple (pShow)
-
-
 import qualified Data.Text.Lazy as LT
 
+type ParseMonad = ExceptT ParseError IO
+
+substr :: Ptr CChar -> Word32 -> Word32 -> ParseMonad String
+substr s nodeStartByte nodeEndByte = liftIO $ peekCStringLen (plusPtr s $ fromIntegral nodeStartByte, fromIntegral $ nodeEndByte - nodeStartByte)
+
+
+convertTree:: Ptr Node -> Ptr CChar -> ParseMonad Term
+convertTree concrete s = do
+  Node {..} <- liftIO $ peek concrete
+  -- TODO: check if node is missing
+  theType <- liftIO $ peekCString nodeType
+  let childCount = fromIntegral nodeChildCount
+  children <- liftIO $ mallocArray childCount
+  tsNode <- liftIO malloc
+  liftIO $ poke tsNode nodeTSNode
+  liftIO $ ts_node_copy_child_nodes tsNode children
+  case theType of
+    "program" -> convertTree (advancePtr children 0) s
+    "paren_term" -> convertTree (advancePtr children 1) s
+    "abstraction" -> do
+      term <- convertTree (advancePtr children 3) s
+      Node {..} <- liftIO $ peekElemOff children 1
+      bound <- substr s nodeStartByte nodeEndByte
+      return $ Abstraction bound term
+    "application" -> do
+      left <- convertTree (advancePtr children 0) s
+      right <- convertTree (advancePtr children 1) s
+      return $ Application left right
+    "variable" -> do
+      name <- substr s nodeStartByte nodeEndByte
+      return $ Variable name
+    "bin_op" -> do
+      left <- convertTree (advancePtr children 0) s
+      right <- convertTree (advancePtr children 2) s
+      Node {..} <- liftIO $ peekElemOff children 1
+      operator <- substr s nodeStartByte nodeEndByte
+      return $ BinOp operator left right
+    "number" -> do
+      value <- substr s nodeStartByte nodeEndByte
+      return . Number $ read value
+    "boolean" -> do
+      value <- substr s nodeStartByte nodeEndByte
+      case value of
+        "⊤" -> return $ Boolean True
+        "⊥" -> return $ Boolean False
+    "ERROR" -> do
+      let TSPoint {..} = nodeStartPoint
+      element <- substr s nodeStartByte nodeEndByte
+      throwError $ newErrorMessage (UnExpect element) (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
+
+
+parseTerm :: String -> IO(Either ParseError Term)
+parseTerm s = do
+  parser <- ts_parser_new
+  ts_parser_set_language parser tree_sitter_demoniclambda
+
+  (str, len) <- newCStringLen s
+  tree       <- ts_parser_parse_string parser nullPtr str len
+  n          <- malloc
+  ts_tree_root_node_p tree n
+
+  runExceptT $ convertTree n str
 
 
 
-lexer :: Tok.TokenParser ()
-lexer = Tok.makeTokenParser style
-        where
-                style = emptyDef {
-                        Tok.reservedOpNames = [],
-                        Tok.commentLine = comment,
-                        Tok.reservedNames = [lambda],
-                        Tok.identStart   = letter <|> char '_',
-                        Tok.identLetter  = alphaNum <|> char '_'
-                }
-
-integer :: Parser Integer
-integer = Tok.integer lexer
-
-float :: Parser Double
-float = Tok.float lexer
-
-parens :: Parser a -> Parser a
-parens = Tok.parens lexer
-
-commaSep :: Parser a -> Parser [a]
-commaSep = Tok.commaSep lexer
-
-semiSep :: Parser a -> Parser [a]
-semiSep = Tok.semiSep lexer
-
-identifier :: Parser String
-identifier = Tok.identifier lexer
-
-reserved :: String -> Parser ()
-reserved = Tok.reserved lexer
-
-symbol :: String -> Parser ()
-symbol s = Tok.symbol lexer s >> return ()
-
-reservedOp :: String -> Parser ()
-reservedOp = Tok.reservedOp lexer
-
-dot :: Parser ()
-dot = Tok.dot lexer >> return ()
-
-whiteSpace :: Parser ()
-whiteSpace = Tok.whiteSpace lexer >> return ()
-
-
-
-
-
-
-
-
-
-abstraction :: Parser Term
-abstraction = parens $ do
-        symbol lambda
-        name <- identifier
-        dot
-        t <- term
-        return $ Abstraction name t
-
-
-application :: Parser Term
-application = parens $ do
-        t1 <- term
-        t2 <- term
-        return $ Application t1 t2
-
-number :: Parser Term
-number = do
-        n <- integer
-        return $ Number n
-
-binary s f assoc = Ex.Infix (reservedOp s >> return f) assoc
-
-table = [[binary "·" (BinOp "·") Ex.AssocLeft,
-          binary "/" (BinOp "/") Ex.AssocLeft]
-        ,[binary "+" (BinOp "+") Ex.AssocLeft,
-          binary "-" (BinOp "-") Ex.AssocLeft]
-        ,[binary "∧" (BinOp "∧") Ex.AssocRight]
-        ,[binary "∨" (BinOp "∨") Ex.AssocRight]]
-
-expr :: Parser Term
-expr = Ex.buildExpressionParser table term
-
-bTrue :: Parser Term
-bTrue = symbol "⊤" >> return (Boolean True)
-bFalse :: Parser Term
-bFalse = symbol "⊥" >> return (Boolean False)
-
-boolean :: Parser Term
-boolean = try bTrue <|> try bFalse
-
-variable = identifier >>= return . Variable
-
-
-term :: Parser Term
-term = try (parens expr) <|> try abstraction <|> try application <|> try variable <|> try number <|> try boolean
-
-contents :: Parser a -> Parser a
-contents p = do
-  whiteSpace
-  r <- p
-  eof
-  return r
-
-
-parseTerm :: String -> Either ParseError Term
-parseTerm s = parse (contents term) "<stdin>" s
 
 type Context = M.Map String Term
 
@@ -178,6 +162,7 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
 
 
 
+
 main :: IO ()
 main = runInputT defaultSettings loop
         where
@@ -186,13 +171,12 @@ main = runInputT defaultSettings loop
                         case ms of
                                 Nothing -> return ()
                                 Just s -> do
-                                        let p = parseTerm s
+                                        p <- liftIO (parseTerm s)
                                         case p of
                                                 Left err -> outputStrLn . show $ err
-                                                --Right ast -> outputStrLn . show $ eval M.empty ast
-                                                Right ast -> do
-                                                        outputStrLn . LT.unpack . pShow $ transformCPS ast
-                                                        liftIO . codegen $ transformCPS ast
-                                                        return ()
+                                                Right ast -> outputStrLn . show $ eval M.empty ast
+                                                --Right ast -> do
+                                                --        outputStrLn . LT.unpack . pShow $ transformCPS ast
+                                                --        liftIO . codegen $ transformCPS ast
+                                                --        return ()
                                         loop
-

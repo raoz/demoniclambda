@@ -28,5 +28,8 @@ executable demoniclambda
                        bytestring >= 0.10.8.2 && < 1,
                        text >= 1.2.3.1 && < 2,
                        pretty-simple >= 2.2 && < 3,
+                       haskell-tree-sitter,
+                       haskell-tree-sitter-demoniclambda,
                        punycode >= 2.0 && < 3
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N
   extensions:          OverloadedStrings, GeneralizedNewtypeDeriving, RecursiveDo
