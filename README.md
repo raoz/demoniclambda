@@ -33,6 +33,7 @@ Form:
 t ★ t
 
 Current supported operators are:
+
  | Operator | Semantics |
  | -------- | --------- |
  |    +     | Integer addition |
@@ -41,7 +42,7 @@ Current supported operators are:
  |    ·     | Integer multiplication |
  |    ∧     | Logical and |
  |    ∨     | Logical or | 
- |-----------------------|
+
 
 Operator prescedence is that of standard mathematics.
 
