@@ -4,6 +4,7 @@
 *.ll
 *.o
 *.out
+*.dλ
 
 
 # Created by https://www.gitignore.io/api/vim,linux,haskell,windows

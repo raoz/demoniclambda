@@ -21,6 +21,7 @@ import Data.Char (isAscii)
 import qualified Data.Map as M
 import Text.Pretty.Simple (pShow)
 
+import LLVM.Analysis
 
 
 import qualified Data.Text as T
@@ -137,8 +138,6 @@ cgena localArgs _ (CNumber n) = do
         int32 n >>= store var 0
         bitcast var voidptr
 
---
---
 cgena localArgs frees (CAbstraction fname innerFrees _ _) = do
         -- traceM ("cgena " <> fname)
         fptr <- demonicfunref $ codename fname
@@ -266,6 +265,7 @@ primBinOp "·" = mul
 primBinOp "/"   = sdiv
 primBinOp "∧" = I.and
 primBinOp "∨"  = I.or
+
 
 
 
