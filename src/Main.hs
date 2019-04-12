@@ -37,7 +37,6 @@ import           Foreign.Storable               ( peek
                                                 , poke
                                                 )
 import           Foreign.Marshal.Utils          ( new )
-import           Control.Monad
 
 import Foreign
 import Foreign.C
@@ -53,12 +52,19 @@ import qualified Data.Text.Lazy as LT
 type ParseMonad = ExceptT ParseError IO
 
 substr :: Ptr CChar -> Word32 -> Word32 -> ParseMonad String
-substr s nodeStartByte nodeEndByte = liftIO $ peekCStringLen (plusPtr s $ fromIntegral nodeStartByte, fromIntegral $ nodeEndByte - nodeStartByte)
+substr s nodeStartByte nodeEndByte = liftIO $
+        peekCStringLen (plusPtr s $ fromIntegral nodeStartByte, fromIntegral $ nodeEndByte - nodeStartByte)
 
 convertAssignment :: Ptr Node -> Ptr CChar -> ParseMonad (String, Term)
 convertAssignment concrete s = do
         Node {..} <- liftIO $ peek concrete
-        -- TODO: check if node is missing
+
+        when (isMissing /= 0) $ do
+                let TSPoint {..} = nodeStartPoint
+                throwError $ newErrorMessage
+                        (Expect "assignment")
+                        (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
+
         theType <- liftIO $ peekCString nodeType
         let childCount = fromIntegral nodeChildCount
         children <- liftIO $ mallocArray childCount
@@ -66,7 +72,7 @@ convertAssignment concrete s = do
         liftIO $ poke tsNode nodeTSNode
         liftIO $ ts_node_copy_child_nodes tsNode children
 
-        term <- convertTree (advancePtr children 2) s
+        term <- convertTree (advancePtr children 2) "assignment righthand value" s
         Node {..} <- liftIO $ peekElemOff children 0
         bound <- substr s nodeStartByte nodeEndByte
 
@@ -75,10 +81,16 @@ convertAssignment concrete s = do
 constructProgram :: (String, Term) -> Term -> Term
 constructProgram (v, t1) t2 = Application (Abstraction v t2) t1
 
-convertTree:: Ptr Node -> Ptr CChar -> ParseMonad Term
-convertTree concrete s = do
+convertTree:: Ptr Node -> String -> Ptr CChar -> ParseMonad Term
+convertTree concrete expected s = do
         Node {..} <- liftIO $ peek concrete
-        -- TODO: check if node is missing
+
+        when (isMissing /= 0) $ do
+                let TSPoint {..} = nodeStartPoint
+                throwError $ newErrorMessage
+                        (Expect expected)
+                        (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
+
         theType <- liftIO $ peekCString nodeType
         let childCount = fromIntegral nodeChildCount
         children <- liftIO $ mallocArray childCount
@@ -88,24 +100,24 @@ convertTree concrete s = do
         case theType of
                 "program" -> do
                         assignments <- forM [0..childCount-2] $ \n -> convertAssignment (advancePtr children n) s
-                        main <- convertTree (advancePtr children (childCount - 1)) s
+                        main <- convertTree (advancePtr children (childCount - 1)) "main expression" s
                         return $ foldr constructProgram main assignments
-                "paren_term" -> convertTree (advancePtr children 1) s
+                "paren_term" -> convertTree (advancePtr children 1) "expression in parentheses" s
                 "abstraction" -> do
-                        term <- convertTree (advancePtr children 3) s
+                        term <- convertTree (advancePtr children 3) "abstraction righthand value" s
                         Node {..} <- liftIO $ peekElemOff children 1
                         bound <- substr s nodeStartByte nodeEndByte
                         return $ Abstraction bound term
                 "application" -> do
-                        left <- convertTree (advancePtr children 0) s
-                        right <- convertTree (advancePtr children 1) s
+                        left <- convertTree (advancePtr children 0) "appliable function" s
+                        right <- convertTree (advancePtr children 1) "application argument" s
                         return $ Application left right
                 "variable" -> do
                         name <- substr s nodeStartByte nodeEndByte
                         return $ Variable name
                 "bin_op" -> do
-                        left <- convertTree (advancePtr children 0) s
-                        right <- convertTree (advancePtr children 2) s
+                        left <- convertTree (advancePtr children 0) "lefthand expr of bin_op" s
+                        right <- convertTree (advancePtr children 2) "righthand expr of bin_op" s
                         Node {..} <- liftIO $ peekElemOff children 1
                         operator <- substr s nodeStartByte nodeEndByte
                         return $ BinOp operator left right
@@ -120,7 +132,9 @@ convertTree concrete s = do
                 otherwise -> do
                         let TSPoint {..} = nodeStartPoint
                         element <- substr s nodeStartByte nodeEndByte
-                        throwError $ newErrorMessage (UnExpect element) (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
+                        throwError $ newErrorMessage
+                                (UnExpect element)
+                                (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
 
 parseTerm :: String -> IO(Either ParseError Term)
 parseTerm s = do
@@ -132,7 +146,7 @@ parseTerm s = do
         n          <- malloc
         ts_tree_root_node_p tree n
 
-        runExceptT $ convertTree n str
+        runExceptT $ convertTree n "program" str
 
 
 type Context = M.Map String Term
@@ -143,14 +157,14 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
                 eval' :: Context -> Term -> Term
                 eval' c (Variable x)
                         | x `M.member` c = eval (M.delete x c) (c M.! x)
-                        | otherwise    = Variable x 
-                eval' c (Abstraction v m) 
+                        | otherwise    = Variable x
+                eval' c (Abstraction v m)
                         | reduced == m = Abstraction v m
                         | otherwise = Abstraction v reduced
                         where
                                 reduced = eval c m
                 eval' c (Application (Abstraction v x) m) = eval (M.insert v m c) x
-                eval' c (Application t m) 
+                eval' c (Application t m)
                         | reducedAbs == t = Application t m
                         | otherwise = eval c (Application reducedAbs m)
                         where
@@ -167,7 +181,7 @@ eval c t = trace ("C: " <> show c <> " T: " <> show t) (eval' c t)
                 eval' c (BinOp op a b)
                         | (BinOp op a b) == reduced = BinOp op a b
                         | otherwise = eval c reduced
-                        where 
+                        where
                                 reduced = BinOp op (eval c a) (eval c b)
 
                 eval' c x = x
@@ -192,7 +206,7 @@ main = do
                                         liftIO . codegen $ transformCPS ast
                                         return ()
 
-                        
+
                 otherwise -> runInputT defaultSettings loop
                 where
                         loop = do
@@ -203,7 +217,7 @@ main = do
                                                 p <- liftIO (parseTerm s)
                                                 case p of
                                                         Left err -> outputStrLn . show $ err
-                                                        Right ast -> 
+                                                        Right ast ->
                                                                 outputStrLn . show $ eval M.empty ast
                                                         --Right ast -> do
                                                         --        outputStrLn . LT.unpack . pShow $ transformCPS ast
