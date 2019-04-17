@@ -1,6 +1,7 @@
 {-# LANGUAGE ViewPatterns #-}
 module Codegen where
 
+import LLVM
 import CPS
 import Control.Monad.State
 
@@ -34,6 +35,7 @@ import LLVM.AST.Typed
 import LLVM.AST.Type as AST
 import qualified LLVM.AST.Float as F
 import qualified LLVM.AST.Constant as C
+import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.IntegerPredicate as P
 
 import LLVM.IRBuilder.Module
@@ -56,6 +58,7 @@ encodename str
 
 codename :: String -> Name
 codename = Name . encodename
+
 
 
 -----------
@@ -116,7 +119,7 @@ cgenc localArgs frees (CApplication f args) = do
         argOps <- mapM (cgena localArgs frees) args
         argVOps <- mapM (\arg -> bitcast arg voidptr) argOps
         let right = take 2 (argVOps ++ repeat nullptr)
-        call funp . zip (ctx:right) $ repeat []
+        fastCall funp . zip (ctx:right) $ repeat []
         --cgena [] (CNumber 42)
 
 
@@ -171,17 +174,29 @@ codegenTop cexp = do
                 num
                 $ \[] -> mdo
                         _entry <- block `named` "entry"
-                        resvoidptr <- cgenc (\x -> error $ "Variable " <> x <> " cannot be defined because it occurs at the top level") [] cexp
+                        resvoidptr <- mainCgenc (\x -> error $ "Variable " <> x <> " cannot be defined because it occurs at the top level") [] cexp
                         resnumptr  <- bitcast resvoidptr (ptr num)
                         res <- load resnumptr 0
                         ret res
         return ()
+        where
+                mainCgenc localArgs frees (CApplication f args) = do
+                        left <- cgena localArgs frees f
+                        leftCast <- bitcast left $ ptr closure
+                        funpPos <- gep leftCast [consti32 0, consti32 0]
+                        ctxPos  <- gep leftCast [consti32 0, consti32 1]
+                        funp <- load funpPos 0
+                        ctx  <- load ctxPos 0
+                        argOps <- mapM (cgena localArgs frees) args
+                        argVOps <- mapM (\arg -> bitcast arg voidptr) argOps
+                        let right = take 2 (argVOps ++ repeat nullptr)
+                        fastCallNoTail funp . zip (ctx:right) $ repeat []
 
 
         
 codegenAbs :: Aexp -> ModuleBuilder ()
 codegenAbs (CAbstraction (stripPrefix "operator" -> Just f) frees args Bottom) = do
-        function 
+        fastFun 
                 (codename ("operator" <> f))
                 sig
                 voidptr
@@ -206,7 +221,7 @@ codegenAbs (CAbstraction (stripPrefix "operator" -> Just f) frees args Bottom) =
 
                         funp <- load funpPos 0
                         innerctx  <- load ctxPos 0
-                        call funp [(innerctx, []), (resptr, []), (nullptr, [])] >>= ret
+                        fastCall funp [(innerctx, []), (resptr, []), (nullptr, [])] >>= ret
         return ()
         where
                 sig = take 3 $ [(voidptr, ParameterName $ encodename "ctx")] <> toSig args <> repeat (voidptr, "unused")
@@ -215,7 +230,7 @@ codegenAbs (CAbstraction (stripPrefix "operator" -> Just f) frees args Bottom) =
 codegenAbs (CAbstraction _ frees args Bottom) = error "Unknown bottom function"
 
 codegenAbs (CAbstraction name frees args cexp) = do
-        function 
+        fastFun 
                 (codename name)
                 sig
                 voidptr
@@ -230,7 +245,7 @@ codegenAbs (CAbstraction name frees args cexp) = do
 
 codegenCTop :: ModuleBuilder ()
 codegenCTop = do
-        function 
+        fastFun 
                 (codename "ctop") 
                 [(voidptr, "unused"), (voidptr, "res"), (voidptr, "unused")]
                 voidptr
@@ -274,8 +289,8 @@ codegen topExp = withContext $ \ctx -> do
         --putStrLn . show $ ppllvm newast
         LVM.withModuleFromAST ctx newast $ \m -> do --(trace (LT.unpack $ pShow newast) newast) $ \m -> do
                 traceM "lowered"
-                verify m
-                traceM "verif"
+                --verify m
+                --traceM "verif"
                 llstr <- LVM.moduleLLVMAssembly m
                 BS.putStrLn llstr
                 LVM.writeLLVMAssemblyToFile (LVM.File "a.ll") m
