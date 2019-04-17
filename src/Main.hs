@@ -4,7 +4,7 @@ module Main where
 
 import Debug.Trace
 
-import Syntax
+import AST
 import CPS
 import Codegen
 
@@ -14,19 +14,6 @@ import System.IO
 import System.Environment
 
 import System.Console.Haskeline
-import Control.Monad.IO.Class
-
-import           TreeSitter.Parser
-import           TreeSitter.Tree
-import           TreeSitter.Language
-import           TreeSitter.DemonicLambda
-import           TreeSitter.Node
-import           Foreign.C.String
-import           Foreign.C.Types
-import           Foreign.Ptr                    ( Ptr(..)
-                                                , nullPtr
-                                                , plusPtr
-                                                )
 import           Foreign.Marshal.Alloc          ( malloc
                                                 , mallocBytes
                                                 )
@@ -38,116 +25,12 @@ import           Foreign.Storable               ( peek
                                                 )
 import           Foreign.Marshal.Utils          ( new )
 
-import Foreign
-import Foreign.C
 import GHC.Generics
-import Text.Parsec.Error
-import Text.Parsec.Pos
 import Control.Monad
 import Control.Monad.Except
 
 import Text.Pretty.Simple (pShow)
 import qualified Data.Text.Lazy as LT
-
-type ParseMonad = ExceptT ParseError IO
-
-substr :: Ptr CChar -> Word32 -> Word32 -> ParseMonad String
-substr s nodeStartByte nodeEndByte = liftIO $
-        peekCStringLen (plusPtr s $ fromIntegral nodeStartByte, fromIntegral $ nodeEndByte - nodeStartByte)
-
-convertAssignment :: Ptr Node -> Ptr CChar -> ParseMonad (String, Term)
-convertAssignment concrete s = do
-        Node {..} <- liftIO $ peek concrete
-
-        when (isMissing /= 0) $ do
-                let TSPoint {..} = nodeStartPoint
-                throwError $ newErrorMessage
-                        (Expect "assignment")
-                        (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
-
-        theType <- liftIO $ peekCString nodeType
-        let childCount = fromIntegral nodeChildCount
-        children <- liftIO $ mallocArray childCount
-        tsNode <- liftIO malloc
-        liftIO $ poke tsNode nodeTSNode
-        liftIO $ ts_node_copy_child_nodes tsNode children
-
-        term <- convertTree (advancePtr children 2) "assignment righthand value" s
-        Node {..} <- liftIO $ peekElemOff children 0
-        bound <- substr s nodeStartByte nodeEndByte
-
-        return $ (bound, term)
-
-constructProgram :: (String, Term) -> Term -> Term
-constructProgram (v, t1) t2 = Application (Abstraction v t2) t1
-
-convertTree:: Ptr Node -> String -> Ptr CChar -> ParseMonad Term
-convertTree concrete expected s = do
-        Node {..} <- liftIO $ peek concrete
-
-        when (isMissing /= 0) $ do
-                let TSPoint {..} = nodeStartPoint
-                throwError $ newErrorMessage
-                        (Expect expected)
-                        (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
-
-        theType <- liftIO $ peekCString nodeType
-        let childCount = fromIntegral nodeChildCount
-        children <- liftIO $ mallocArray childCount
-        tsNode <- liftIO malloc
-        liftIO $ poke tsNode nodeTSNode
-        liftIO $ ts_node_copy_child_nodes tsNode children
-        case theType of
-                "program" -> do
-                        assignments <- forM [0..childCount-2] $ \n -> convertAssignment (advancePtr children n) s
-                        main <- convertTree (advancePtr children (childCount - 1)) "main expression" s
-                        return $ foldr constructProgram main assignments
-                "paren_term" -> convertTree (advancePtr children 1) "expression in parentheses" s
-                "abstraction" -> do
-                        term <- convertTree (advancePtr children 3) "abstraction righthand value" s
-                        Node {..} <- liftIO $ peekElemOff children 1
-                        bound <- substr s nodeStartByte nodeEndByte
-                        return $ Abstraction bound term
-                "application" -> do
-                        left <- convertTree (advancePtr children 0) "appliable function" s
-                        right <- convertTree (advancePtr children 1) "application argument" s
-                        return $ Application left right
-                "variable" -> do
-                        name <- substr s nodeStartByte nodeEndByte
-                        return $ Variable name
-                "bin_op" -> do
-                        left <- convertTree (advancePtr children 0) "lefthand expr of bin_op" s
-                        right <- convertTree (advancePtr children 2) "righthand expr of bin_op" s
-                        Node {..} <- liftIO $ peekElemOff children 1
-                        operator <- substr s nodeStartByte nodeEndByte
-                        return $ BinOp operator left right
-                "number" -> do
-                        value <- substr s nodeStartByte nodeEndByte
-                        return . Number $ read value
-                "boolean" -> do
-                        value <- substr s nodeStartByte nodeEndByte
-                        case value of
-                                "⊤" -> return $ Boolean True
-                                "⊥" -> return $ Boolean False
-                otherwise -> do
-                        let TSPoint {..} = nodeStartPoint
-                        element <- substr s nodeStartByte nodeEndByte
-                        throwError $ newErrorMessage
-                                (UnExpect element)
-                                (newPos "<stdin>" (fromIntegral pointRow) (fromIntegral pointColumn))
-
-parseTerm :: String -> IO(Either ParseError Term)
-parseTerm s = do
-        parser <- ts_parser_new
-        ts_parser_set_language parser tree_sitter_demoniclambda
-
-        (str, len) <- newCStringLen s
-        tree       <- ts_parser_parse_string parser nullPtr str len
-        n          <- malloc
-        ts_tree_root_node_p tree n
-
-        runExceptT $ convertTree n "program" str
-
 
 type Context = M.Map String Term
 

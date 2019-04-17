@@ -35,7 +35,6 @@ resolver: lts-13.10
 #  - wai
 packages:
 - .
-- 'vendor/haskell-tree-sitter-demoniclambda'
 - 'vendor/haskell-tree-sitter'
 
 # Dependency packages to be pulled from upstream that are not in the resolver

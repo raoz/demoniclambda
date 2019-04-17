@@ -1,6 +1,6 @@
 module CPS where
 
-import Syntax
+import AST
 
 import Control.Monad.State
 
