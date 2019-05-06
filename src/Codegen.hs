@@ -99,6 +99,19 @@ primref name = pure . ConstantOperand $ C.GlobalReference (ptr . maybe (error $ 
         where
                 trueName = codename name
 
+mallocate :: (MonadIRBuilder m, MonadModuleBuilder m) => Type -> Maybe Operand -> m Operand
+mallocate ty count = do
+        let typtr = ConstantOperand $ C.Null (AST.ptr ty)
+        let n = maybe (ConstantOperand $ C.Int 64 1) id count
+        size <- gep typtr [n]
+        size_int <- ptrtoint size AST.i64
+        malloc <- primref "malloc"
+        memory_addr <- call malloc [(size_int, [])]
+        bitcast memory_addr $ AST.ptr ty
+
+
+
+        
 
 
 cgenc :: (MonadIRBuilder m, MonadModuleBuilder m) => (String -> Operand) -> [String] -> Cexp -> m Operand
@@ -126,7 +139,7 @@ cgenc localArgs frees (CApplication f args) = do
 
 createClosure :: (MonadIRBuilder m, MonadModuleBuilder m) => (String -> Operand) -> [String] -> [String] -> m Operand
 createClosure localArgs frees contextFrees = do
-        ctx <- alloca (voidptr) (Just . consti32 . fromIntegral $ Data.List.length frees) 0
+        ctx <- mallocate (voidptr) (Just . consti32 . fromIntegral $ Data.List.length frees)
 --        ctx <- alloca (context frees) Nothing 0
         forM (zip [0..] frees) $ \(i, free) -> do
                 var <- cgena localArgs contextFrees (CVariable free)
@@ -137,7 +150,7 @@ createClosure localArgs frees contextFrees = do
 
 cgena :: (MonadIRBuilder m, MonadModuleBuilder m) => (String -> Operand) -> [String] -> Aexp -> m Operand
 cgena localArgs _ (CNumber n) = do
-        var <- alloca num Nothing 0
+        var <- mallocate num Nothing
         int32 n >>= store var 0
         bitcast var voidptr
 
@@ -145,7 +158,7 @@ cgena localArgs frees (CAbstraction fname innerFrees _ _) = do
         -- traceM ("cgena " <> fname)
         fptr <- demonicfunref $ codename fname
         ctx <- createClosure localArgs innerFrees frees
-        cl <- alloca closure Nothing 0
+        cl <- mallocate closure Nothing
         fpos <- gep cl [consti32 0, consti32 0]
         cpos <- gep cl [consti32 0, consti32 1]
         store fpos 0 fptr
@@ -211,7 +224,7 @@ codegenAbs (CAbstraction (stripPrefix "operator" -> Just f) frees args Bottom) =
                         bb <- bitcast bptr (ptr num) >>= \p -> load p 0
 
                         res <- primBinOp f aa bb 
-                        var <- alloca num Nothing 0
+                        var <- mallocate num Nothing
                         store var 0 res
                         resptr <- bitcast var voidptr
 
@@ -266,11 +279,13 @@ declareExterns = do
         forM primExternal $ \(name, retty, args, vararg) -> extern name args retty  
         return ()
 
+--                                    vararg
 primExternal :: [(Name, Type, [Type], Bool)]
-primExternal = [(codename "exit", voidptr, [AST.i32], False)]
+primExternal = [(codename "exit", voidptr, [AST.i32], False)
+               ,(codename "malloc", voidptr, [AST.i64], False)]
 
 primExternalType :: [(Name, Type)]
-primExternalType = map (\(name, retty, argty, vararg) -> (codename "exit", AST.FunctionType retty argty vararg)) primExternal 
+primExternalType = map (\(name, retty, argty, vararg) -> (name, AST.FunctionType retty argty vararg)) primExternal 
 
 
 primBinOp :: MonadIRBuilder m => String -> (Operand -> Operand -> m Operand)
